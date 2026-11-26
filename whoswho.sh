@@ -2,12 +2,15 @@
 #
 # whoswho.sh - Interactive nmap wrapper with auto subnet detection & indexed logging
 #
-# Educational tool: prompts before each scan stage, shows the exact command
-# being run, and saves output to indexed, timestamped files for later
-# correlation/parsing by other tools.
+# Educational tool: shows the exact command being run and saves output to
+# indexed, timestamped files for later correlation/parsing by other tools.
 #
 # USAGE: ./whoswho.sh
 #   WHOSWHO_OUTDIR=/path ./whoswho.sh    override the output location
+#
+# Stage selection:
+#   all          host discovery + ONE combined nmap command, no per-step prompts
+#   1,2,7 / 1-4  chosen stages, each confirmed individually
 #
 # Note: no `set -e` on purpose. Failed scans and declined prompts are
 # expected and handled explicitly.
@@ -22,6 +25,60 @@ SESSION_DIR="${OUTDIR}/session_${TS}"
 INDEX_FILE="${SESSION_DIR}/00_index.txt"
 STEP=0
 LAST_OUTFILE=""
+ALL_MODE=0        # 1 when the user picked "all"
+AUTO_CONFIRM=0    # 1 = skip the per-step "Run this command now?" prompt
+
+# The "all" one-liner. -O needs root, so it's added only when running as root.
+ALL_FLAGS="-sV -sC -p- -T4"
+[[ $EUID -eq 0 ]] && ALL_FLAGS+=" -O"
+
+# ---------- Stage table ----------
+# To add a preset: bump MAX_STAGE and add one line to each array.
+# STAGE_ROOT=1 means the stage is skipped when not running as root.
+# Stage 1 (host discovery) is special-cased; stage 14 prompts for custom flags.
+MAX_STAGE=14
+CUSTOM_STAGE=14
+
+declare -A STAGE_LABEL=(
+    [1]="Host discovery (ping sweep)"
+    [2]="Fast port scan (top 100 ports)"
+    [3]="Service/version detection"
+    [4]="OS detection"
+    [5]="Full TCP port scan (all 65535 ports)"
+    [6]="Default NSE script scan"
+    [7]="Service + default scripts"
+    [8]="Service + default scripts, all ports"
+    [9]="Aggressive scan"
+    [10]="Aggressive scan, all ports"
+    [11]="Full recon (SYN, version, scripts, OS, all ports)"
+    [12]="UDP scan (top 50 ports)"
+    [13]="Vulnerability scripts"
+    [14]="Custom flags (you type them)"
+)
+declare -A STAGE_SUFFIX=(
+    [1]="host_discovery" [2]="fast_port_scan" [3]="service_version"
+    [4]="os_detection"   [5]="full_port_scan" [6]="script_scan"
+    [7]="sv_sc"          [8]="sv_sc_allports" [9]="aggressive"
+    [10]="aggressive_allports" [11]="full_recon" [12]="udp_top50"
+    [13]="vuln_scripts"  [14]="custom"
+)
+declare -A STAGE_FLAGS=(
+    [1]="-sn"
+    [2]="-T4 --top-ports 100"
+    [3]="-sV -T4"
+    [4]="-O -T4"
+    [5]="-p- -T4"
+    [6]="-sC -T4"
+    [7]="-sV -sC -T4"
+    [8]="-sV -sC -p- -T4"
+    [9]="-A -T4"
+    [10]="-A -p- -T4"
+    [11]="-sS -sV -sC -O -p- -T4"
+    [12]="-sU --top-ports 50 -T4"
+    [13]="-sV --script vuln -T4"
+    [14]=""
+)
+declare -A STAGE_ROOT=( [4]=1 [11]=1 [12]=1 )
 
 # ---------- Helpers ----------
 
@@ -56,6 +113,25 @@ ask() { # ask "prompt" "default" -> echoes value
 # so input can never be parsed as an nmap option.
 valid_target() {
     [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*$ ]]
+}
+
+# Custom nmap flags: letters, digits, space and a few safe punctuation chars.
+valid_flags() {
+    [[ "$1" =~ ^-[A-Za-z0-9\ ._,:=/-]*$ ]]
+}
+
+print_menu() {
+    local n root_tag
+    for n in $(seq 1 "$MAX_STAGE"); do
+        root_tag=""
+        [[ "${STAGE_ROOT[$n]:-0}" == "1" ]] && root_tag="  [root]"
+        if [[ "$n" == "$CUSTOM_STAGE" ]]; then
+            printf '  %2d) %-48s nmap <your flags>\n' "$n" "${STAGE_LABEL[$n]}"
+        else
+            printf '  %2d) %-48s nmap %s%s\n' "$n" "${STAGE_LABEL[$n]}" "${STAGE_FLAGS[$n]}" "$root_tag"
+        fi
+    done
+    printf '  all) %-47s nmap -sn, then nmap %s\n' "Auto-run, no per-step prompts" "$ALL_FLAGS"
 }
 
 summarize_output() {
@@ -99,6 +175,7 @@ summarize_output() {
 run_step() {
     # run_step "label" "output_suffix" cmd [args...]
     # Sets LAST_OUTFILE to the saved output path, or "" if skipped.
+    # Skips the per-step prompt when AUTO_CONFIRM=1.
     local label="$1" suffix="$2"
     shift 2
     local -a cmd=("$@")
@@ -117,7 +194,7 @@ run_step() {
     echo "  $cmd_str"
     echo
 
-    if ! confirm "Run this command now?"; then
+    if [[ "$AUTO_CONFIRM" != "1" ]] && ! confirm "Run this command now?"; then
         color "31" "Skipped."
         echo "${idx} | ${label} | ${cmd_str} | SKIPPED" >> "$INDEX_FILE"
         return 0
@@ -177,7 +254,7 @@ echo "Session output directory: $SESSION_DIR"
 } > "$INDEX_FILE"
 
 if [[ $EUID -ne 0 ]]; then
-    color "33" "Note: not running as root - SYN scans (-sS) fall back to TCP connect scans and OS detection (-O) will be skipped. Use sudo for full functionality."
+    color "33" "Note: not running as root - stages marked [root] are skipped, -O is left out of 'all', and SYN scans fall back to TCP connect scans. Use sudo for full functionality."
     echo
 fi
 
@@ -219,40 +296,47 @@ echo
 # ---------- Scan plan ----------
 
 banner "Scan Plan"
-cat <<EOF
-Choose which stages to run against $TARGET. You'll still be shown the
-exact nmap command and asked to confirm before each one actually runs.
-
-  1) Host discovery (ping sweep)       - find live hosts
-  2) Fast port scan (top 100 ports)    - quick TCP scan
-  3) Service/version detection         - -sV on nmap's default top 1000 ports
-  4) OS detection                      - -O (best effort, needs root)
-  5) Full TCP port scan (slow)         - -p- all 65535 ports
-  6) Script scan (default NSE scripts) - -sC on nmap's default top 1000 ports
-
-All output is saved to: $SESSION_DIR
-An index file correlating steps to commands is at: $INDEX_FILE
-EOF
+echo "Choose which stages to run against $TARGET."
+echo "Individual stages show the exact nmap command and ask before each one."
+echo "'all' runs host discovery and one combined scan with no further prompts."
 echo
-color "33" "Enter stage numbers, e.g. '1,2,3' or '1-4', or 'all'."
-color "33" "If stage 1 runs, stages 2-6 scan only the live hosts it finds;"
+print_menu
+echo
+echo "All output is saved to: $SESSION_DIR"
+echo "An index file correlating steps to commands is at: $INDEX_FILE"
+echo
+color "33" "Enter stage numbers, e.g. '1,2,7' or '1-4,9', or 'all'."
+color "33" "If stage 1 runs, the other stages scan only the live hosts it finds;"
 color "33" "otherwise they scan the full target."
 echo
 
 SELECTION="$(ask "Stages to run" "all")"
 
-declare -A RUN_STAGE=( [1]=0 [2]=0 [3]=0 [4]=0 [5]=0 [6]=0 )
+declare -A RUN_STAGE=()
+for n in $(seq 1 "$MAX_STAGE"); do RUN_STAGE[$n]=0; done
 
 if [[ "${SELECTION,,}" == "all" ]]; then
-    for n in 1 2 3 4 5 6; do RUN_STAGE[$n]=1; done
+    ALL_MODE=1
+    AUTO_CONFIRM=1
+    RUN_STAGE[1]=1
 else
     IFS=',' read -ra PARTS <<< "$SELECTION"
     for part in "${PARTS[@]}"; do
         part="${part//[[:space:]]/}"
-        if [[ "$part" =~ ^([1-6])-([1-6])$ ]]; then
-            for ((n = BASH_REMATCH[1]; n <= BASH_REMATCH[2]; n++)); do RUN_STAGE[$n]=1; done
-        elif [[ "$part" =~ ^[1-6]$ ]]; then
-            RUN_STAGE[$part]=1
+        if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            lo=$((10#${BASH_REMATCH[1]})); hi=$((10#${BASH_REMATCH[2]}))
+            if (( lo >= 1 && hi <= MAX_STAGE && lo <= hi )); then
+                for ((n = lo; n <= hi; n++)); do RUN_STAGE[$n]=1; done
+            else
+                color "31" "Ignoring out-of-range entry: '$part'"
+            fi
+        elif [[ "$part" =~ ^[0-9]+$ ]]; then
+            n=$((10#$part))
+            if (( n >= 1 && n <= MAX_STAGE )); then
+                RUN_STAGE[$n]=1
+            else
+                color "31" "Ignoring out-of-range entry: '$part'"
+            fi
         elif [[ -n "$part" ]]; then
             color "31" "Ignoring unrecognized entry: '$part'"
         fi
@@ -260,23 +344,30 @@ else
 fi
 
 CHOSEN=""
-for n in 1 2 3 4 5 6; do
+for n in $(seq 1 "$MAX_STAGE"); do
     [[ "${RUN_STAGE[$n]}" == "1" ]] && CHOSEN+="$n "
 done
 [[ -n "$CHOSEN" ]] || { color "31" "No valid stages selected. Exiting."; exit 0; }
 
-echo "Selected stages: $CHOSEN"
+if [[ "$ALL_MODE" == "1" ]]; then
+    echo "Selected: all (auto-run, no per-step prompts)"
+    echo "  1) nmap -sn $TARGET"
+    echo "  2) nmap $ALL_FLAGS <live hosts, or $TARGET if none found>"
+else
+    echo "Selected stages: $CHOSEN"
+fi
 echo
-confirm "Proceed with the selected stages against $TARGET?" || { color "31" "Aborted by user."; exit 0; }
+confirm "Proceed against $TARGET?" || { color "31" "Aborted by user."; exit 0; }
 echo
 
 # ---------- Run stages ----------
 
-# Targets for stages 2-6: the full target, or -iL <live hosts> after stage 1.
+# Targets for later stages: the full target, or -iL <live hosts> after stage 1.
 TARGET_ARGS=("$TARGET")
 
 if [[ "${RUN_STAGE[1]}" == "1" ]]; then
-    run_step "Host discovery (ping sweep)" "host_discovery" nmap -sn "$TARGET"
+    read -ra flags <<< "${STAGE_FLAGS[1]}"
+    run_step "${STAGE_LABEL[1]}" "${STAGE_SUFFIX[1]}" nmap "${flags[@]}" "$TARGET"
 
     if [[ -n "$LAST_OUTFILE" ]]; then
         LIVE_HOSTS_FILE="${SESSION_DIR}/live_hosts.txt"
@@ -290,40 +381,48 @@ if [[ "${RUN_STAGE[1]}" == "1" ]]; then
             color "32" "Found $(wc -l < "$LIVE_HOSTS_FILE") live host(s). Saved to $LIVE_HOSTS_FILE"
             TARGET_ARGS=(-iL "$LIVE_HOSTS_FILE")
         else
-            color "33" "No live hosts parsed (hosts may block ping). Falling back to full target."
+            color "33" "No live hosts parsed (hosts may block ping)."
+            # An unattended all-ports scan of the whole range is worth one extra check.
+            if [[ "$ALL_MODE" == "1" ]]; then
+                confirm "Scan the full target $TARGET anyway?" || { color "31" "Aborted."; exit 0; }
+            else
+                color "33" "Falling back to full target."
+            fi
         fi
         echo
     fi
 fi
 
-declare -A STAGE_LABEL=(
-    [2]="Fast port scan (top 100 ports)"
-    [3]="Service/version detection"
-    [4]="OS detection"
-    [5]="Full TCP port scan (all 65535 ports)"
-    [6]="Default NSE script scan"
-)
-declare -A STAGE_SUFFIX=(
-    [2]="fast_port_scan" [3]="service_version" [4]="os_detection"
-    [5]="full_port_scan" [6]="script_scan"
-)
-declare -A STAGE_FLAGS=(
-    [2]="-T4 --top-ports 100" [3]="-sV -T4" [4]="-O -T4"
-    [5]="-p- -T4"             [6]="-sC -T4"
-)
+if [[ "$ALL_MODE" == "1" ]]; then
+    read -ra flags <<< "$ALL_FLAGS"
+    run_step "Combined scan (all)" "all_combined" nmap "${flags[@]}" "${TARGET_ARGS[@]}"
+else
+    for n in $(seq 2 "$MAX_STAGE"); do
+        [[ "${RUN_STAGE[$n]}" == "1" ]] || continue
 
-for n in 2 3 4 5 6; do
-    [[ "${RUN_STAGE[$n]}" == "1" ]] || continue
+        if [[ "${STAGE_ROOT[$n]:-0}" == "1" && $EUID -ne 0 ]]; then
+            color "33" "Skipping stage $n (${STAGE_LABEL[$n]}): requires root."
+            echo
+            continue
+        fi
 
-    if [[ "$n" == "4" && $EUID -ne 0 ]]; then
-        color "33" "Skipping stage 4 (OS detection): requires root."
-        echo
-        continue
-    fi
+        label="${STAGE_LABEL[$n]}"
+        flag_str="${STAGE_FLAGS[$n]}"
 
-    read -ra flags <<< "${STAGE_FLAGS[$n]}"
-    run_step "${STAGE_LABEL[$n]}" "${STAGE_SUFFIX[$n]}" nmap "${flags[@]}" "${TARGET_ARGS[@]}"
-done
+        if [[ "$n" == "$CUSTOM_STAGE" ]]; then
+            flag_str="$(ask "Enter nmap flags (no target)" "-sV -sC -p-")"
+            if ! valid_flags "$flag_str"; then
+                color "31" "Invalid flags (must start with '-', letters/digits/. , : = / only). Skipping custom stage."
+                echo
+                continue
+            fi
+            label="Custom: $flag_str"
+        fi
+
+        read -ra flags <<< "$flag_str"
+        run_step "$label" "${STAGE_SUFFIX[$n]}" nmap "${flags[@]}" "${TARGET_ARGS[@]}"
+    done
+fi
 
 # ---------- Wrap up ----------
 
