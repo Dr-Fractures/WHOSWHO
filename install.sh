@@ -1,50 +1,20 @@
 #!/usr/bin/env bash
 #
-# install.sh - installs (or removes) whoswho as a system-wide command
+# install.sh - installs whoswho.sh as a system-wide 'whoswho' command
 #
-# USAGE:
-#   ./install.sh            install
-#   ./install.sh --remove   uninstall
-#
+
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_PATH="${REPO_DIR}/whoswho.sh"
-LINK_PATH="/usr/local/bin/whoswho"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET="/usr/local/bin/whoswho"
 
-do_link() {
-    if [[ -w /usr/local/bin ]]; then
-        "$@"
-    else
-        sudo "$@"
-    fi
-}
-
-if [[ "${1:-}" == "--remove" ]]; then
-    if [[ -L "$LINK_PATH" || -f "$LINK_PATH" ]]; then
-        do_link rm -f "$LINK_PATH"
-        echo "Removed $LINK_PATH"
-    else
-        echo "Nothing to remove at $LINK_PATH"
-    fi
-    exit 0
-fi
-
-if [[ ! -f "$SCRIPT_PATH" ]]; then
-    echo "Error: whoswho.sh not found in $REPO_DIR"
+if [[ $EUID -ne 0 ]]; then
+    echo "[!] Run this installer with sudo." >&2
     exit 1
 fi
 
-chmod +x "$SCRIPT_PATH"
+chmod +x "$SCRIPT_DIR/whoswho.sh"
+ln -sf "$SCRIPT_DIR/whoswho.sh" "$TARGET"
 
-echo "Installing whoswho to $LINK_PATH ..."
-do_link ln -sf "$SCRIPT_PATH" "$LINK_PATH"
-
-if command -v whoswho >/dev/null 2>&1; then
-    echo "Done. Run it from anywhere with: whoswho"
-    echo "(use 'sudo whoswho' for full SYN-scan / OS-detection capability)"
-    echo "To uninstall: ./install.sh --remove"
-else
-    echo "Install finished, but 'whoswho' isn't on your PATH yet."
-    echo "Make sure /usr/local/bin is in your PATH, or run directly with: $SCRIPT_PATH"
-fi
+echo "[*] Installed. Symlinked $SCRIPT_DIR/whoswho.sh -> $TARGET"
+echo "[*] Run with: sudo whoswho"
