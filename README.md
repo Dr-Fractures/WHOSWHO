@@ -28,7 +28,9 @@ Named after the Zombies Gobblegum that reveals a downed player's identity — fi
 ```bash
 git clone https://github.com/Dr-Fractures/WHOSWHO.git
 cd WHOSWHO
-./install.sh
+chmod +x install.sh
+sudo ./install.sh
+sudo whoswho
 ```
 
 This symlinks `whoswho.sh` to `/usr/local/bin/whoswho` so it can be run from anywhere.
